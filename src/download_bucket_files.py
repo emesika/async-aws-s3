@@ -40,19 +40,26 @@ def _require_creds() -> None:
 def _is_downloadable_entry(entry) -> bool:
     """
     Decide whether this entry represents a real S3 object (not a prefix).
+
     Handles:
       - aioboto3 dicts: {"Key": "...", "Size": 0/whatever}
       - aioaws ObjectMeta: obj.key, obj.size
       - obstore dicts: {"path": "...", "size": ...}
       - obstore ObjectMeta: entry.path, entry.size
+      - plain key strings: "foo/bar/baz"
     """
+    # 0. plain string key
+    if isinstance(entry, str):
+        # S3 "folders" are conventionally keys ending with '/'
+        return not entry.endswith("/")
+
     # 1. aioboto3 paginator dict
     if isinstance(entry, dict) and "Key" in entry:
         key = entry["Key"]
         size = entry.get("Size", None)
         return not key.endswith("/") and (size is None or size > 0)
 
-    # 2. aioaws ObjectMeta
+    # 2. aioaws ObjectMeta (or similar)
     if hasattr(entry, "key") and hasattr(entry, "size"):
         return not entry.key.endswith("/") and entry.size > 0
 
@@ -213,14 +220,21 @@ async def list_aioboto3_contents(max_items: int = 100) -> List[str]:
             for obj in contents:
                 key = obj["Key"]
                 print("  -", key)
-                keys.append(key)
+
+                # only collect real files
+                if _is_downloadable_entry(obj):
+                    keys.append(key)
+
                 count += 1
                 if count >= max_items:
                     break
             if count >= max_items:
                 break
 
-        print(f"  -> aioboto3 listed {count} objects (limit {max_items}).")
+        print(
+            f"  -> aioboto3 listed {count} objects (limit {max_items}), "
+            f"{len(keys)} of them are downloadable files."
+        )
 
     return keys
 
@@ -251,12 +265,19 @@ async def list_aioaws_contents(max_items: int = 100) -> List[str]:
         try:
             async for obj in s3.list():
                 print("  -", obj.key)
-                keys.append(obj.key)
+
+                # only collect real files
+                if _is_downloadable_entry(obj):
+                    keys.append(obj.key)
+
                 count += 1
                 if count >= max_items:
                     break
 
-            print(f"  -> aioaws listed {count} objects (limit {max_items}).")
+            print(
+                f"  -> aioaws listed {count} objects (limit {max_items}), "
+                f"{len(keys)} of them are downloadable files."
+            )
         except Exception as e:
             print("  aioaws bucket listing failed:", e)
 
@@ -290,14 +311,21 @@ async def list_obstore_contents(max_items: int = 100) -> List[str]:
 
                 key = str(name)
                 print("  -", key)
-                keys.append(key)
+
+                # only collect real files
+                if _is_downloadable_entry(entry):
+                    keys.append(key)
+
                 count += 1
                 if count >= max_items:
                     break
             if count >= max_items:
                 break
 
-        print(f"  -> obstore listed {count} objects (limit {max_items}).")
+        print(
+            f"  -> obstore listed {count} objects (limit {max_items}), "
+            f"{len(keys)} of them are downloadable files."
+        )
     except Exception as e:
         print("  obstore bucket listing failed:", e)
 
@@ -324,6 +352,7 @@ async def download_aioboto3_files(keys: List[str], outdir: Path) -> None:
 
     async with session.client("s3") as s3:
         for key in keys:
+            # keys list already filtered, but keep a cheap guard
             if not _is_downloadable_entry(key):
                 continue
 
@@ -453,7 +482,7 @@ async def main() -> None:
     await check_aioaws_s3()
     await check_obstore_s3()
 
-    # Bucket listings (limited) – collect keys per interface
+    # Bucket listings (limited) – collect *file* keys per interface
     aioboto_keys = await list_aioboto3_contents(max_items=max_items)
     aioaws_keys = await list_aioaws_contents(max_items=max_items)
     obstore_keys = await list_obstore_contents(max_items=max_items)
