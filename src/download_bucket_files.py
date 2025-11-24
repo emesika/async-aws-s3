@@ -1,8 +1,12 @@
+import argparse
 import asyncio
 import os
 import sys
+from pathlib import Path
+from typing import List
 
 import aioboto3
+import obstore as obs
 from httpx import AsyncClient
 from aioaws.s3 import S3Client as AioAwsS3Client, S3Config as AioAwsS3Config
 from obstore.store import S3Store
@@ -31,6 +35,42 @@ def _require_creds() -> None:
     if missing:
         print("Missing required env vars:", ", ".join(missing), file=sys.stderr)
         sys.exit(1)
+
+
+def _is_downloadable_entry(entry) -> bool:
+    """
+    Decide whether this entry represents a real S3 object (not a prefix).
+    Handles:
+      - aioboto3 dicts: {"Key": "...", "Size": 0/whatever}
+      - aioaws ObjectMeta: obj.key, obj.size
+      - obstore dicts: {"path": "...", "size": ...}
+      - obstore ObjectMeta: entry.path, entry.size
+    """
+    # 1. aioboto3 paginator dict
+    if isinstance(entry, dict) and "Key" in entry:
+        key = entry["Key"]
+        size = entry.get("Size", None)
+        return not key.endswith("/") and (size is None or size > 0)
+
+    # 2. aioaws ObjectMeta
+    if hasattr(entry, "key") and hasattr(entry, "size"):
+        return not entry.key.endswith("/") and entry.size > 0
+
+    # 3. obstore dict format
+    if isinstance(entry, dict) and "path" in entry:
+        key = entry.get("path")
+        size = entry.get("size", None)
+        return (
+            key is not None
+            and not key.endswith("/")
+            and (size is None or size > 0)
+        )
+
+    # 4. obstore ObjectMeta
+    if hasattr(entry, "path") and hasattr(entry, "size"):
+        return not entry.path.endswith("/") and entry.size > 0
+
+    return False
 
 
 # --------------------------------------------------------------------
@@ -105,7 +145,7 @@ async def check_obstore_s3() -> None:
     # S3Store will read creds from env; we pass region explicitly.
     store = S3Store(
         bucket=S3_TEST_BUCKET,
-        prefix="",   # list from bucket root
+        prefix="",  # list from bucket root
         region=AWS_REGION,
     )
 
@@ -147,20 +187,22 @@ async def check_obstore_s3() -> None:
 # --------------------------------------------------------------------
 # Full listings with a configurable max_items
 # --------------------------------------------------------------------
-async def list_aioboto3_contents(max_items: int = 100) -> None:
+async def list_aioboto3_contents(max_items: int = 100) -> List[str]:
     print(
-        f"\n=== aioboto3: listing up to {max_items} objects "
+        f"\n=== aioboto3: listing up to {max_items} objects (Downloading only files) "
         f"from bucket {S3_TEST_BUCKET!r} ==="
     )
     if not S3_TEST_BUCKET:
         print("  S3_TEST_BUCKET not set; skipping.")
-        return
+        return []
 
     session = aioboto3.Session(
         aws_access_key_id=AWS_ACCESS_KEY_ID,
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
         region_name=AWS_REGION,
     )
+
+    keys: List[str] = []
 
     async with session.client("s3") as s3:
         paginator = s3.get_paginator("list_objects_v2")
@@ -169,7 +211,9 @@ async def list_aioboto3_contents(max_items: int = 100) -> None:
         async for page in paginator.paginate(Bucket=S3_TEST_BUCKET):
             contents = page.get("Contents", [])
             for obj in contents:
-                print("  -", obj["Key"])
+                key = obj["Key"]
+                print("  -", key)
+                keys.append(key)
                 count += 1
                 if count >= max_items:
                     break
@@ -178,15 +222,19 @@ async def list_aioboto3_contents(max_items: int = 100) -> None:
 
         print(f"  -> aioboto3 listed {count} objects (limit {max_items}).")
 
+    return keys
 
-async def list_aioaws_contents(max_items: int = 100) -> None:
+
+async def list_aioaws_contents(max_items: int = 100) -> List[str]:
     print(
-        f"\n=== aioaws: listing up to {max_items} objects "
+        f"\n=== aioaws: listing up to {max_items} objects (Downloading only files) "
         f"from bucket {S3_TEST_BUCKET!r} ==="
     )
     if not S3_TEST_BUCKET:
         print("  S3_TEST_BUCKET not set; skipping.")
-        return
+        return []
+
+    keys: List[str] = []
 
     async with AsyncClient(timeout=30) as http_client:
         s3 = AioAwsS3Client(
@@ -203,6 +251,7 @@ async def list_aioaws_contents(max_items: int = 100) -> None:
         try:
             async for obj in s3.list():
                 print("  -", obj.key)
+                keys.append(obj.key)
                 count += 1
                 if count >= max_items:
                     break
@@ -211,15 +260,17 @@ async def list_aioaws_contents(max_items: int = 100) -> None:
         except Exception as e:
             print("  aioaws bucket listing failed:", e)
 
+    return keys
 
-async def list_obstore_contents(max_items: int = 100) -> None:
+
+async def list_obstore_contents(max_items: int = 100) -> List[str]:
     print(
-        f"\n=== obstore: listing up to {max_items} objects "
+        f"\n=== obstore: listing up to {max_items} objects (Downloading only files) "
         f"from bucket {S3_TEST_BUCKET!r} ==="
     )
     if not S3_TEST_BUCKET:
         print("  S3_TEST_BUCKET not set; skipping.")
-        return
+        return []
 
     store = S3Store(
         bucket=S3_TEST_BUCKET,
@@ -227,6 +278,7 @@ async def list_obstore_contents(max_items: int = 100) -> None:
         region=AWS_REGION,
     )
 
+    keys: List[str] = []
     count = 0
     try:
         async for batch in store.list_async(prefix=""):
@@ -236,7 +288,9 @@ async def list_obstore_contents(max_items: int = 100) -> None:
                 else:
                     name = getattr(entry, "path", str(entry))
 
-                print("  -", name)
+                key = str(name)
+                print("  -", key)
+                keys.append(key)
                 count += 1
                 if count >= max_items:
                     break
@@ -247,6 +301,122 @@ async def list_obstore_contents(max_items: int = 100) -> None:
     except Exception as e:
         print("  obstore bucket listing failed:", e)
 
+    return keys
+
+
+# --------------------------------------------------------------------
+# Downloads for each interface
+# --------------------------------------------------------------------
+async def download_aioboto3_files(keys: List[str], outdir: Path) -> None:
+    base = outdir / "aioboto3"
+    base.mkdir(parents=True, exist_ok=True)
+    print(f"\n=== aioboto3: downloading {len(keys)} objects into {base} ===")
+
+    if not keys:
+        print("  (no keys to download)")
+        return
+
+    session = aioboto3.Session(
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_REGION,
+    )
+
+    async with session.client("s3") as s3:
+        for key in keys:
+            if not _is_downloadable_entry(key):
+                continue
+
+            local_path = base / key
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+
+            try:
+                resp = await s3.get_object(Bucket=S3_TEST_BUCKET, Key=key)
+                body = resp["Body"]
+                # aiobotocore-style streaming body
+                async with body:
+                    with open(local_path, "wb") as f:
+                        while True:
+                            chunk = await body.read(1 * 1024 * 1024)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                print(f"  downloaded: {key} -> {local_path}")
+            except Exception as e:
+                print(f"  FAILED to download {key!r} via aioboto3:", e)
+
+
+async def download_aioaws_files(keys: List[str], outdir: Path) -> None:
+    base = outdir / "aioaws"
+    base.mkdir(parents=True, exist_ok=True)
+    print(f"\n=== aioaws: downloading {len(keys)} objects into {base} ===")
+
+    if not keys:
+        print("  (no keys to download)")
+        return
+
+    async with AsyncClient(timeout=60) as http_client:
+        s3 = AioAwsS3Client(
+            http_client,
+            AioAwsS3Config(
+                AWS_ACCESS_KEY_ID,
+                AWS_SECRET_ACCESS_KEY,
+                AWS_REGION,
+                S3_TEST_BUCKET,
+            ),
+        )
+
+        for key in keys:
+            if not _is_downloadable_entry(key):
+                continue
+
+            local_path = base / key
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+
+            try:
+                # aioaws generates a signed download URL; we fetch via httpx
+                url = s3.signed_download_url(key, max_age=3600)
+                async with http_client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    with open(local_path, "wb") as f:
+                        async for chunk in resp.aiter_bytes():
+                            f.write(chunk)
+                print(f"  downloaded: {key} -> {local_path}")
+            except Exception as e:
+                print(f"  FAILED to download {key!r} via aioaws:", e)
+
+
+async def download_obstore_files(keys: List[str], outdir: Path) -> None:
+    base = outdir / "obstore"
+    base.mkdir(parents=True, exist_ok=True)
+    print(f"\n=== obstore: downloading {len(keys)} objects into {base} ===")
+
+    if not keys:
+        print("  (no keys to download)")
+        return
+
+    store = S3Store(
+        bucket=S3_TEST_BUCKET,
+        prefix="",
+        region=AWS_REGION,
+    )
+
+    for key in keys:
+        if not _is_downloadable_entry(key):
+            continue
+
+        local_path = base / key
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            resp = await obs.get_async(store, key)
+            with open(local_path, "wb") as f:
+                async for chunk in resp:
+                    f.write(chunk)
+            print(f"  downloaded: {key} -> {local_path}")
+        except Exception as e:
+            print(f"  FAILED to download {key!r} via obstore:", e)
+
 
 # --------------------------------------------------------------------
 # Main
@@ -254,27 +424,44 @@ async def list_obstore_contents(max_items: int = 100) -> None:
 async def main() -> None:
     _require_creds()
 
-    # CLI override: python auth.py 50
-    max_items = DEFAULT_MAX_ITEMS
-    if len(sys.argv) > 1:
-        try:
-            max_items = int(sys.argv[1])
-        except ValueError:
-            print(
-                f"Invalid max_items {sys.argv[1]!r}; "
-                f"falling back to default {DEFAULT_MAX_ITEMS}",
-                file=sys.stderr,
-            )
+    parser = argparse.ArgumentParser(
+        description=(
+            "Auth + list + download from S3 using aioboto3, aioaws, and obstore.\n"
+            "Keys listed by each interface are downloaded into subdirectories of --outdir."
+        )
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_MAX_ITEMS,
+        help=f"Max objects to list/download per interface (default: {DEFAULT_MAX_ITEMS}).",
+    )
+    parser.add_argument(
+        "--outdir",
+        type=str,
+        required=True,
+        help="Base directory where downloaded files will be stored.",
+    )
+    args = parser.parse_args()
+
+    max_items = args.limit
+    outdir = Path(args.outdir).expanduser().resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
 
     # Auth checks
     await check_aioboto3_sts()
     await check_aioaws_s3()
     await check_obstore_s3()
 
-    # Bucket listings (limited)
-    await list_aioboto3_contents(max_items=max_items)
-    await list_aioaws_contents(max_items=max_items)
-    await list_obstore_contents(max_items=max_items)
+    # Bucket listings (limited) – collect keys per interface
+    aioboto_keys = await list_aioboto3_contents(max_items=max_items)
+    aioaws_keys = await list_aioaws_contents(max_items=max_items)
+    obstore_keys = await list_obstore_contents(max_items=max_items)
+
+    # Downloads
+    await download_aioboto3_files(aioboto_keys, outdir)
+    await download_aioaws_files(aioaws_keys, outdir)
+    await download_obstore_files(obstore_keys, outdir)
 
 
 if __name__ == "__main__":
