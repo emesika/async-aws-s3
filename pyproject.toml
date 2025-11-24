@@ -1,0 +1,42 @@
+[project]
+name = "aws-s3"
+version = "0.1.0"
+description = "FastAPI AWS S3 API"
+authors = [{ name = "Eli Mesika", email = "elimesika@gmail.com" }]
+requires-python = ">=3.12"
+
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",          # ASGI server
+    "sqlalchemy[asyncio]>=2.0",   # SQLAlchemy 2.x with asyncio
+    "asyncpg",                    # PostgreSQL async driver
+    "pydantic>=2",                # Pydantic v2
+    "pydantic-settings",          # Env config (optional, used below)
+    "aioboto3>=15.5.0",
+    "aioaws",
+    "obstore",
+    "httpx",
+    "aiofiles",
+]
+
+[tool.pdm]
+
+[tool.pdm.scripts]
+dev = "uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+
+[tool.pdm.dev-dependencies]
+dev = [
+    "pytest",
+    "httpx>=0.27",
+    "ruff",
+    "pytest-asyncio",
+]
+
+[tool.pytest.ini_options]
+pythonpath = [
+  "src"
+]
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
