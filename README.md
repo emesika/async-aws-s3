@@ -59,8 +59,8 @@ pdm venv activate
 Example:
 
 ```bash
-export GITLAB_SERVER="https://gitlab.cee.redhat.com"
-export GITLAB_PROJECT_ID=92265
+export GITLAB_SERVER="https://mygitlab.mydomain.com"
+export GITLAB_PROJECT_ID=1234
 export GITLAB_TOKEN="your_token_here"
 ```
 
